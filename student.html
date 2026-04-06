@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Student Experiment Portal</title>
+
+<script src="https://docs.opencv.org/4.x/opencv.js"></script>
+<script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-app.js"></script>
+<script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-database.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+<style>
+body{
+  font-family:Arial;
+  background:linear-gradient(135deg,#1e3c72,#2a5298);
+  color:white;
+  text-align:center;
+  margin:0;
+}
+
+.container{
+  max-width:1100px;
+  margin:auto;
+  padding:20px;
+}
+
+.card{
+  background:rgba(255,255,255,0.1);
+  padding:25px;
+  border-radius:12px;
+  margin-top:25px;
+}
+
+input{
+  padding:10px;
+  margin:10px;
+  width:250px;
+  border:none;
+  border-radius:6px;
+}
+
+button{
+  padding:10px 20px;
+  border:none;
+  border-radius:6px;
+  background:#00c6ff;
+  color:white;
+  font-weight:bold;
+  cursor:pointer;
+}
+
+#experimentCard{
+  display:none;
+}
+
+video,canvas{
+  border-radius:10px;
+}
+
+canvas{
+  position:absolute;
+  top:0;
+  left:0;
+}
+
+#wrap{
+  position:relative;
+  display:inline-block;
+}
+
+#indicator{
+  width:20px;
+  height:20px;
+  border-radius:50%;
+  background:red;
+  margin:auto;
+}
+
+</style>
+</head>
+
+<body>
+
+<div class="container">
+
+<h2>Student Experiment Portal</h2>
+
+<!-- STUDENT REQUEST -->
+<div class="card" id="loginCard">
+<h3>Request Experiment Access</h3>
+<input id="name" placeholder="Student Name"><br>
+<input id="email" placeholder="Gmail ID"><br>
+<button onclick="requestPermission()">Request Permission</button>
+<p id="msg"></p>
+</div>
+
+<!-- EXPERIMENT PANEL -->
+<div class="card" id="experimentCard">
+<h3>Pupil Tracking Experiment</h3>
+<input id="sid" placeholder="Enter Student ID"><br>
+<button onclick="startSession()">Start Experiment</button>
+<p id="timer">Time Remaining: 30:00</p>
+<div id="indicator"></div>
+<div id="wrap">
+<video id="video" width="960" height="720" autoplay muted></video>
+<canvas id="canvas" width="960" height="720"></canvas>
+</div>
+<p id="status">Waiting for session</p>
+</div>
+
+</div>
+
+<script>
+
+/******** FIREBASE CONFIG ********/
+const firebaseConfig={
+  apiKey:"AIzaSyAEG2L_e4_1qzcUgBo7-zQY2PFXgaHuwwM",
+authDomain:"pupil-tracker-f2a83.firebaseapp.com",
+databaseURL:"https://pupil-tracker-f2a83-default-rtdb.firebaseio.com",
+projectId:"pupil-tracker-f2a83"
+};
+firebase.initializeApp(firebaseConfig);
+const db=firebase.database();
+
+/******** REQUEST PERMISSION ********/
+function requestPermission(){
+  const name=document.getElementById("name").value.trim();
+  const email=document.getElementById("email").value.trim();
+  if(name=="" || email==""){ alert("Enter Name and Gmail"); return; }
+  const id=email.replace(/\./g,"_");
+  db.ref("studentRequests/"+id).set({
+    name:name,
+    email:email,
+    status:"pending",
+    time:Date.now()
+  }).then(()=>{
+    document.getElementById("msg").innerText="Request sent to teacher. Waiting for approval...";
+    checkApproval(id);
+  }).catch(error=>{
+    console.error("Firebase error:",error);
+    alert("Error sending request");
+  });
+}
+
+/******** CHECK APPROVAL ********/
+function checkApproval(id){
+  db.ref("studentRequests/"+id+"/status").on("value",snap=>{
+    const status=snap.val();
+    if(status=="approved"){
+      document.getElementById("loginCard").style.display="none";
+      document.getElementById("experimentCard").style.display="block";
+      document.getElementById("status").innerText="Access Approved. Click 'Start Experiment' to begin.";
+    }
+    if(status=="rejected"){
+      document.getElementById("msg").innerText="Teacher rejected your request.";
+    }
+  });
+}
+
+/******** EXPERIMENT VARIABLES ********/
+let sessionActive=false;
+let studentId=null;
+let sessionId=null;
+let startTime=null;
+const SESSION_DURATION=1800;
+let samples=[],baseline=null,calibrated=false;
+let ratioBuffer=[],smoothRatio=null,displayedChange=0,lastSent=0,lastValidData=null,lastDetectionTime=0;
+const BLINK_TOLERANCE_MS=1200;
+const SMOOTH_FACTOR=0.95;
+const CHANGE_THRESHOLD=2.0;
+let camInstance=null;
+
+/******** START SESSION ********/
+function startSession(){
+  studentId=document.getElementById("sid").value.trim();
+  if(!studentId){ alert("Enter Student ID"); return; }
+
+  sessionActive=true;
+  sessionId="S"+Date.now();
+  startTime=Date.now();
+  samples=[]; baseline=null; calibrated=false;
+  ratioBuffer=[]; smoothRatio=null; displayedChange=0;
+  document.getElementById("status").innerText="Starting Camera and Calibrating...";
+  
+  startCamera();
+}
+
+/******** CAMERA + FACE MESH + PUPIL TRACKING ********/
+function startCamera(){
+  const video=document.getElementById("video");
+  const canvas=document.getElementById("canvas");
+  const ctx=canvas.getContext("2d");
+  const indicator=document.getElementById("indicator");
+
+  navigator.mediaDevices.getUserMedia({video:true})
+  .then(stream=>{
+    video.srcObject=stream;
+
+    const faceMesh=new FaceMesh({
+      locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}`
+    });
+    faceMesh.setOptions({maxNumFaces:1,refineLandmarks:true});
+
+    faceMesh.onResults(results=>{
+      if(!sessionActive) return;
+
+      try{
+        ctx.clearRect(0,0,canvas.width,canvas.height);
+        ctx.drawImage(results.image,0,0,canvas.width,canvas.height);
+
+        // Timer
+        const elapsed=Math.floor((Date.now()-startTime)/1000);
+        const remaining=SESSION_DURATION-elapsed;
+        if(remaining<=0){
+          sessionActive=false;
+          video.srcObject.getTracks().forEach(t=>t.stop());
+          document.getElementById("status").innerText="Session Completed";
+          document.getElementById("timer").innerText="Time Remaining: 00:00";
+          return;
+        }
+        const m=String(Math.floor(remaining/60)).padStart(2,'0');
+        const s=String(remaining%60).padStart(2,'0');
+        document.getElementById("timer").innerText=`Time Remaining: ${m}:${s}`;
+
+        if(!results.multiFaceLandmarks || results.multiFaceLandmarks.length===0){
+          if(Date.now()-lastDetectionTime<BLINK_TOLERANCE_MS && lastValidData){
+            useLastData(); return;
+          } else {
+            indicator.style.background="red";
+            document.getElementById("status").innerText="Face not detected…";
+            return;
+          }
+        }
+
+        const lm=results.multiFaceLandmarks[0];
+        const left=[468,469,470,471,472], right=[473,474,475,476,477];
+
+        function irisData(ids){
+          const xs=[], ys=[];
+          ids.forEach(i=>{ if(lm[i]){ xs.push(lm[i].x*canvas.width); ys.push(lm[i].y*canvas.height); }});
+          if(xs.length<3) return null;
+          const cx=xs.reduce((a,b)=>a+b)/xs.length;
+          const cy=ys.reduce((a,b)=>a+b)/ys.length;
+          const r=(Math.max(...xs)-Math.min(...xs))/2;
+          return {cx,cy,r};
+        }
+
+        function detectPupil(data){
+          if(!data||!data.r) return null;
+          const size=Math.round(data.r*3.8); if(size<25) return null;
+          const x=Math.max(0, Math.min(canvas.width-size, Math.round(data.cx-size/2)));
+          const y=Math.max(0, Math.min(canvas.height-size, Math.round(data.cy-size/2)));
+          const src=cv.imread(canvas);
+          const roi=src.roi(new cv.Rect(x,y,size,size));
+          const gray=new cv.Mat(); cv.cvtColor(roi,gray,cv.COLOR_RGBA2GRAY);
+          const clahe=new cv.CLAHE(3.0,new cv.Size(8,8)); clahe.apply(gray,gray);
+          cv.GaussianBlur(gray,gray,new cv.Size(3,3),0);
+          const thresh=new cv.Mat();
+          cv.adaptiveThreshold(gray,thresh,255,cv.ADAPTIVE_THRESH_GAUSSIAN_C,cv.THRESH_BINARY_INV,15,2);
+          const contours=new cv.MatVector(), hier=new cv.Mat();
+          cv.findContours(thresh,contours,hier,cv.RETR_EXTERNAL,cv.CHAIN_APPROX_SIMPLE);
+          let best=null, maxA=0;
+          for(let i=0;i<contours.size();i++){
+            const cnt=contours.get(i); const area=cv.contourArea(cnt);
+            if(area>maxA){
+              const circle=cv.minEnclosingCircle(cnt);
+              if(circle.radius<data.r*1.5 && circle.radius>data.r*0.1){
+                maxA=area; best={r:circle.radius, cx:circle.center.x+x, cy:circle.center.y+y};
+              }
+            } cnt.delete();
+          }
+          roi.delete(); gray.delete(); thresh.delete(); contours.delete(); hier.delete(); src.delete();
+          return best;
+        }
+
+        function drawCross(cx,cy,size=5,color="lime"){
+          ctx.strokeStyle=color; ctx.lineWidth=2;
+          ctx.beginPath(); ctx.moveTo(cx-size,cy); ctx.lineTo(cx+size,cy);
+          ctx.moveTo(cx,cy-size); ctx.lineTo(cx,cy+size); ctx.stroke();
+        }
+
+        function processEye(ids,color){
+          const iris=irisData(ids); if(!iris) return null;
+          ctx.beginPath(); ctx.arc(iris.cx,iris.cy,iris.r+2,0,2*Math.PI);
+          ctx.strokeStyle=color; ctx.lineWidth=2; ctx.stroke();
+          const pupil=detectPupil({...iris});
+          if(pupil){
+            ctx.beginPath(); ctx.arc(pupil.cx,pupil.cy,pupil.r,0,2*Math.PI);
+            ctx.strokeStyle="red"; ctx.lineWidth=2; ctx.stroke();
+            ctx.fillStyle="rgba(255,0,0,0.2)";
+            ctx.beginPath(); ctx.arc(pupil.cx,pupil.cy,pupil.r,0,2*Math.PI); ctx.fill();
+            drawCross(pupil.cx,pupil.cy);
+          }
+          return {iris,pupil};
+        }
+
+        const L=processEye(left,"yellow"), R=processEye(right,"yellow");
+        const eyesDetected=L&&L.pupil&&R&&R.pupil;
+
+        if(eyesDetected){
+          indicator.style.background="limegreen";
+          let ratio=((L.pupil.r/L.iris.r)+(R.pupil.r/R.iris.r))/2;
+          if(smoothRatio==null) smoothRatio=ratio;
+          smoothRatio=SMOOTH_FACTOR*smoothRatio+(1-SMOOTH_FACTOR)*ratio;
+          ratioBuffer.push(smoothRatio);
+          if(ratioBuffer.length>10) ratioBuffer.shift();
+          const avgRatio=ratioBuffer.reduce((a,b)=>a+b)/ratioBuffer.length;
+
+          if(!calibrated){
+            samples.push(avgRatio);
+            if(samples.length>40){
+              baseline=samples.reduce((a,b)=>a+b)/samples.length;
+              calibrated=true;
+            }
+          }
+
+          let change=calibrated?((avgRatio-baseline)/baseline)*100:0;
+          if(Math.abs(change)<CHANGE_THRESHOLD) change=0;
+          displayedChange=0.9*displayedChange+0.1*change;
+
+          document.getElementById("status").innerText=
+            `Normalized Dilation: ${avgRatio.toFixed(3)} | Change: ${displayedChange.toFixed(2)} %`;
+
+          lastValidData={ratio:avgRatio,baseline,change:displayedChange,remaining};
+          lastDetectionTime=Date.now();
+
+          if(calibrated && Date.now()-lastSent>1000){
+            lastSent=Date.now();
+            db.ref("pupilData/"+studentId+"/"+Date.now()).set({
+              studentId,normalizedRatio:avgRatio,baseline,
+              changePercent:displayedChange,timeRemaining:remaining,timestamp:Date.now()
+            });
+          }
+        } else {
+          if(Date.now()-lastDetectionTime<BLINK_TOLERANCE_MS && lastValidData){
+            useLastData();
+          } else {
+            indicator.style.background="red";
+            document.getElementById("status").innerText="Eyes not detected…";
+          }
+        }
+
+      }catch(e){ console.error(e); }
+
+      function useLastData(){
+        indicator.style.background="limegreen";
+        document.getElementById("status").innerText=
+          `Blink tolerance active | Change: ${displayedChange.toFixed(2)} %`;
+      }
+
+    });
+
+    camInstance=new Camera(video,{onFrame:async()=>await faceMesh.send({image:video}),width:960,height:720});
+    camInstance.start();
+
+  }).catch(err=>{
+    alert("Camera permission required");
+    console.error(err);
+  });
+}
+
+</script>
+</body>
+</html>
